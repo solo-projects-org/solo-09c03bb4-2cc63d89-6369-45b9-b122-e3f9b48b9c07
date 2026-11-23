@@ -199,6 +199,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         rule = pipeline.get_rule_version(dataset, item["current_rules_version"])
         item["current_spec"] = rule["spec"] if rule else None
         item["partitions"] = pipeline.partition_summary(dataset)
+        switch = pipeline.get_channel_switch(dataset)
+        item["channel_key_enabled"] = switch is not None
+        item["channel_switch"] = switch
         return item
 
     @app.get("/api/datasets/{dataset}/rules")
@@ -225,6 +228,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise PipelineError("expected_version must be an integer", code="invalid_spec")
         return pipeline.add_rule_version(
             dataset, spec, body.get("note"), expected_version=expected
+        )
+
+    @app.get("/api/datasets/{dataset}/channel-switch")
+    async def get_channel_switch(dataset: str, request: Request):
+        pipeline: Pipeline = request.app.state.pipeline
+        if pipeline.get_dataset(dataset) is None:
+            raise PipelineError(f"unknown dataset {dataset!r}", code="unknown_dataset")
+        return {"switch": pipeline.get_channel_switch(dataset)}
+
+    @app.post("/api/datasets/{dataset}/channel-switch", status_code=200)
+    async def enable_channel_switch(dataset: str, request: Request):
+        pipeline: Pipeline = request.app.state.pipeline
+        if pipeline.get_dataset(dataset) is None:
+            raise PipelineError(f"unknown dataset {dataset!r}", code="unknown_dataset")
+        body = await _json_body(request)
+        # The switch rewrites trusted parquet files: keep it off the event loop,
+        # matching how batch processing is scheduled.
+        return await run_in_threadpool(
+            pipeline.enable_channel_key, dataset, body.get("note")
         )
 
     @app.get("/api/datasets/{dataset}/partitions")

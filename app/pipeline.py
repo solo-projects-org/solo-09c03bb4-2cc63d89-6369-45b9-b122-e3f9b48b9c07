@@ -57,6 +57,21 @@ BATCH_PUBLISHED = "published"
 
 BATCH_STATUSES = (BATCH_ACCEPTED, BATCH_RUNNING, BATCH_FAILED, BATCH_PUBLISHED)
 
+# Acceptance semantics for the composite channel key.
+#   legacy  - accepted before the one-time switch: single string order_id key,
+#             no channel column; whenever such a batch is published it is
+#             classified as the "direct" channel.
+#   channel - accepted after the switch: every input row carries a channel
+#             column with value direct or partner and the full-table key is
+#             (channel, order_id).
+CHANNEL_MODE_LEGACY = "legacy"
+CHANNEL_MODE_CHANNEL = "channel"
+
+CHANNEL_DIRECT = "direct"
+CHANNEL_PARTNER = "partner"
+CHANNEL_VALUES = (CHANNEL_DIRECT, CHANNEL_PARTNER)
+CHANNEL_FIELD = "channel"
+
 ARROW_TYPES = {
     "string": pa.string(),
     "integer": pa.int64(),
@@ -249,9 +264,14 @@ class Pipeline:
             FROM datasets d ORDER BY d.name
             """
         )
+        switched = {
+            row["dataset"]: row
+            for row in self.db.query_dicts("SELECT dataset FROM channel_key_switches")
+        }
         for row in rows:
             row["created_at"] = str(row["created_at"])
             row["updated_at"] = str(row["updated_at"])
+            row["channel_key_enabled"] = row["name"] in switched
         return rows
 
     def create_dataset(
@@ -321,6 +341,222 @@ class Pipeline:
             )
         return {"name": dataset, "version": version, "spec": spec}
 
+    # ==================================================================
+    # One-time composite channel key switch
+    # ==================================================================
+    def get_channel_switch(self, dataset: str) -> dict[str, Any] | None:
+        rows = self.db.query_dicts(
+            "SELECT dataset, rules_version, switched_at FROM channel_key_switches"
+            " WHERE dataset = ?",
+            [dataset],
+        )
+        if not rows:
+            return None
+        rows[0]["switched_at"] = str(rows[0]["switched_at"])
+        return rows[0]
+
+    def channel_enabled(self, dataset: str) -> bool:
+        return self.get_channel_switch(dataset) is not None
+
+    def enable_channel_key(self, dataset: str, note: str | None = None) -> dict[str, Any]:
+        """Perform the one-time switch to the (channel, order_id) full-table key.
+
+        The switch is idempotent: when channel semantics are already effective
+        for the dataset the existing effective rule version is returned without
+        creating another version.  On any failure nothing is committed and the
+        whole system keeps operating under the legacy semantics.
+        """
+        # Serialize against batch processing so a switch can never interleave
+        # with validation/commit work.
+        with self._run_lock:
+            existing = self.get_channel_switch(dataset)
+            if existing is not None:
+                return {
+                    "dataset": dataset,
+                    "already_effective": True,
+                    "rules_version": int(existing["rules_version"]),
+                    "switched_at": existing["switched_at"],
+                }
+
+            ds = self.get_dataset(dataset)
+            if ds is None:
+                raise PipelineError(f"unknown dataset {dataset!r}", code="unknown_dataset")
+            current_version = int(ds["current_rules_version"])
+            current_rule = self.get_rule_version(dataset, current_version)
+            assert current_rule is not None
+            current_spec = normalize_spec(current_rule["spec"], None)
+
+            # The switch is defined for the legacy single string-key layout.
+            if CHANNEL_FIELD in {field["name"] for field in current_spec["fields"]}:
+                raise PipelineError(
+                    f"dataset {dataset!r} already declares a {CHANNEL_FIELD!r} field;"
+                    " the channel-key switch cannot be applied",
+                    code="invalid_state",
+                )
+            if list(current_spec["primary_key"]) != ["order_id"]:
+                raise PipelineError(
+                    f"dataset {dataset!r} does not use the legacy single order_id key,"
+                    " so the channel-key switch does not apply",
+                    code="invalid_state",
+                )
+            order_id_field = next(
+                (field for field in current_spec["fields"] if field["name"] == "order_id"),
+                None,
+            )
+            if order_id_field is None or order_id_field.get("type") != "string":
+                raise PipelineError(
+                    f"dataset {dataset!r}: order_id must be a string field for the"
+                    " channel-key switch",
+                    code="invalid_state",
+                )
+            running = self.db.fetchone(
+                "SELECT COUNT(*) FROM batches WHERE dataset = ? AND status = ?",
+                [dataset, BATCH_RUNNING],
+            )
+            if running and int(running[0]) > 0:
+                raise PipelineError(
+                    "a batch of this dataset is currently being processed;"
+                    " retry the switch after it finishes",
+                    code="invalid_state",
+                )
+
+            new_spec = self._channel_spec(current_spec)
+            # Validate fully, including reference declarations, before touching
+            # any file or metadata.
+            refs = self.latest_references()
+            new_spec = normalize_spec(
+                new_spec, lambda ref_name: refs.get(ref_name)
+            )
+
+            # Rewrite already trusted files first, with per-file backups.  The
+            # metadata transaction below is the only commit point: if it fails,
+            # backups are restored and readers keep seeing legacy files.
+            try:
+                migrated, backups = self._migrate_trusted_files_to_channel(dataset)
+            except PipelineError:
+                raise
+            except Exception as exc:
+                raise PipelineError(
+                    f"channel-key switch failed while migrating trusted files: {exc}",
+                    code="switch_failed",
+                ) from exc
+
+            version = current_version + 1
+            now = _utcnow()
+            try:
+                with self.db.transaction() as conn:
+                    conn.execute(
+                        "INSERT INTO rule_versions (dataset, version, spec, note, created_at)"
+                        " VALUES (?, ?, CAST(? AS JSON), ?, ?)",
+                        [dataset, version, _dumps(new_spec), note, now],
+                    )
+                    conn.execute(
+                        "UPDATE datasets SET current_rules_version = ?, updated_at = ?"
+                        " WHERE name = ?",
+                        [version, now, dataset],
+                    )
+                    conn.execute(
+                        "INSERT INTO channel_key_switches (dataset, rules_version, switched_at)"
+                        " VALUES (?, ?, ?)",
+                        [dataset, version, now],
+                    )
+            except BaseException as exc:
+                # The metadata commit point failed: roll back every migrated
+                # file so acceptance, dedup and preview keep legacy semantics.
+                for target, backup in backups:
+                    try:
+                        if backup.exists():
+                            shutil.move(str(backup), str(target))
+                    except OSError:  # pragma: no cover - best effort restore
+                        log.exception("could not restore %s from %s", target, backup)
+                if isinstance(exc, PipelineError):
+                    raise
+                raise PipelineError(
+                    f"channel-key switch failed while committing metadata: {exc}",
+                    code="switch_failed",
+                ) from exc
+
+            # Commit succeeded: backups are no longer needed.
+            for _target, backup in backups:
+                try:
+                    backup.unlink(missing_ok=True)
+                except OSError:  # pragma: no cover
+                    log.warning("could not remove backup file %s", backup)
+
+            return {
+                "dataset": dataset,
+                "already_effective": False,
+                "rules_version": version,
+                "migrated_files": migrated,
+                "switched_at": str(now),
+                "spec": new_spec,
+            }
+
+    def _channel_spec(self, legacy_spec: Mapping[str, Any]) -> dict[str, Any]:
+        """Build the channel-aware rule spec from a legacy pinned spec."""
+        fields = [
+            {
+                "name": CHANNEL_FIELD,
+                "type": "string",
+                "required": True,
+                "allowed_values": list(CHANNEL_VALUES),
+                "max_length": 16,
+            }
+        ]
+        fields.extend(dict(field) for field in legacy_spec["fields"])
+        return {
+            "partition_field": legacy_spec["partition_field"],
+            "primary_key": [CHANNEL_FIELD, "order_id"],
+            # Same number across channels must coexist across the whole table,
+            # including different days and different batches.
+            "unique_scope": "dataset",
+            "allow_extra_columns": bool(legacy_spec.get("allow_extra_columns", False)),
+            "fields": fields,
+        }
+
+    def _migrate_trusted_files_to_channel(
+        self, dataset: str
+    ) -> tuple[int, list[tuple[Path, Path]]]:
+        """Add channel='direct' to every trusted parquet file of the dataset.
+
+        Files that already carry a channel column are left untouched.  Each
+        rewritten file keeps a sibling backup until the switch transaction has
+        committed.
+        """
+        rows = self.db.fetchall(
+            "SELECT file_path FROM partition_files WHERE dataset = ?"
+            " ORDER BY acceptance_seq, batch_id",
+            [dataset],
+        )
+        backups: list[tuple[Path, Path]] = []
+        migrated = 0
+        for (path_text,) in rows:
+            target = Path(path_text)
+            if not target.exists():
+                continue
+            schema = pq.read_schema(target)
+            if CHANNEL_FIELD in schema.names:
+                continue
+            table = pq.read_table(target)
+            channel_column = pa.array(
+                [CHANNEL_DIRECT] * table.num_rows, type=pa.string()
+            )
+            table = table.append_column(CHANNEL_FIELD, channel_column)
+            # Match the post-switch spec's physical column order (channel first).
+            table = table.select([CHANNEL_FIELD, *table.column_names[:-1]])
+            backup = target.with_name(target.name + ".pre-channel.bak")
+            if backup.exists():
+                backup.unlink()
+            shutil.move(str(target), str(backup))
+            try:
+                pq.write_table(table, target, compression="zstd")
+            except BaseException:
+                shutil.move(str(backup), str(target))
+                raise
+            backups.append((target, backup))
+            migrated += 1
+        return migrated, backups
+
     def get_rule_version(self, dataset: str, version: int) -> dict[str, Any] | None:
         rows = self.db.query_dicts(
             "SELECT version, spec, note, created_at FROM rule_versions"
@@ -371,6 +607,15 @@ class Pipeline:
         rule = self.get_rule_version(dataset, current_version)
         assert rule is not None
         spec = normalize_spec(rule["spec"], None)
+
+        # The effective key semantics are fixed at acceptance time, exactly
+        # like the rule and reference versions.  A switch that happens later
+        # never changes how this batch is validated or deduplicated.
+        channel_mode = (
+            CHANNEL_MODE_CHANNEL
+            if self.get_channel_switch(dataset) is not None
+            else CHANNEL_MODE_LEGACY
+        )
 
         # Quick structural check at intake so a non-parquet upload is rejected
         # immediately.  Full schema/business validation happens on process.
@@ -428,9 +673,10 @@ class Pipeline:
                     """
                     INSERT INTO batches
                         (id, dataset, acceptance_seq, rules_version, rules_spec,
-                         reference_versions, status, attempt, source_files, accepted_at)
+                         reference_versions, status, attempt, source_files,
+                         channel_mode, accepted_at)
                     VALUES (?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON), ?, 0,
-                            CAST(? AS JSON), ?)
+                            CAST(? AS JSON), ?, ?)
                     """,
                     [
                         batch_id,
@@ -441,6 +687,7 @@ class Pipeline:
                         _dumps(pinned),
                         BATCH_ACCEPTED,
                         _dumps(stored),
+                        channel_mode,
                         _utcnow(),
                     ],
                 )
@@ -717,6 +964,17 @@ class Pipeline:
         spec = normalize_spec(batch["rules_spec"], None)
         pinned_refs: Mapping[str, Any] = batch["reference_versions"]
         source_files: list[dict[str, Any]] = batch["source_files"]
+        # Legacy batches keep validating with their pinned single-key spec.
+        # Once the dataset has switched, files they (re)publish are classified
+        # as the direct channel so every trusted file shares the post-switch
+        # (channel, order_id) physical schema.  Before the switch the legacy
+        # layout is left exactly untouched.
+        emit_channel = (
+            CHANNEL_DIRECT
+            if batch.get("channel_mode") == CHANNEL_MODE_LEGACY
+            and self.channel_enabled(dataset)
+            else None
+        )
         paths = [
             str(self.settings.uploads_dir / batch_id / entry["stored_name"])
             for entry in source_files
@@ -774,7 +1032,9 @@ class Pipeline:
                 try:
                     for index, date_key in enumerate(partitions):
                         target = staging / f"part-{index:06d}.parquet"
-                        count = self._write_partition(spec, date_key, target)
+                        count = self._write_partition(
+                            spec, date_key, target, emit_channel
+                        )
                         if count:
                             written[date_key] = (target, count)
                     self._write_quarantine(batch_id, attempt)
@@ -1216,22 +1476,38 @@ class Pipeline:
         )
 
     def _write_partition(
-        self, spec: Mapping[str, Any], date_key: str, target: Path
+        self,
+        spec: Mapping[str, Any],
+        date_key: str,
+        target: Path,
+        emit_channel: str | None = None,
     ) -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
         partition_ident = quote_ident(spec["partition_field"])
         columns = ", ".join(quote_ident(field["name"]) for field in spec["fields"])
+        if emit_channel is not None:
+            # Legacy pinned spec has no channel column; append the constant
+            # direct channel so the output file matches the switched schema.
+            select_columns = f"? AS {quote_ident(CHANNEL_FIELD)}, {columns}"
+            params: list[Any] = [
+                emit_channel,
+                dt.date.fromisoformat(date_key),
+                str(target),
+            ]
+        else:
+            select_columns = columns
+            params = [dt.date.fromisoformat(date_key), str(target)]
         with self.db.lock:
             self.db.conn.execute(
                 f"""
                 COPY (
-                    SELECT {columns} FROM gsb_typed
+                    SELECT {select_columns} FROM gsb_typed
                     WHERE {partition_ident} = ?
                       AND _gsb_row NOT IN (SELECT row_index FROM gsb_issues)
                     ORDER BY _gsb_row
                 ) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)
                 """,
-                [dt.date.fromisoformat(date_key), str(target)],
+                params,
             )
             if not target.exists():
                 return 0

@@ -28,6 +28,7 @@ python3 scripts/make_sample_data.py sample_data
 3. 上传 `orders_batch2_mixed.parquet` → 2 行发布、4 行进入隔离区；在 **批次与隔离区** 查看每行原因。
 4. **规则版本** 页签修改规则并发布 v2（例如把 `amount.max` 改成 5）；再上传 `orders_batch3_newer.parquet`，新批次按 v2 校验。
 5. 在 **批次与隔离区** 选中一个失败批次，上传修复后的文件重跑：只替换该批次自己的结果，旧的可信分区不受影响。
+6. 联营渠道接入：在 **规则版本** 页签顶部执行「一次性主键切换」，`daily_orders` 的全表主键变为 `(channel, order_id)`；随后上传 `orders_batch4_partner_same_ids.parquet`（联营同号订单）与 `orders_batch5_channel_mixed.parquet`（非法渠道值被隔离），预览中每行都带渠道。
 
 本地（不使用 Docker）运行：
 
@@ -63,6 +64,7 @@ python3 -m pytest tests -q
 | 过期批次不得覆盖后来批次 | 每批次有递增 `acceptance_seq`；分区的最新发布序列更大时，旧批次在写入前和提交前两次被拒绝（409 `stale_batch`） |
 | 校验或写入失败保留旧数据 | 校验失败不落盘；提交阶段用备份 + 回滚恢复旧文件，元数据事务失败同样恢复 |
 | 浏览器入口 | `/`（原生 HTML/CSS/JS，无前端构建步骤），`/docs` 为 OpenAPI |
+| 联营渠道一次性切换 | `POST /api/datasets/{dataset}/channel-switch`：主键由字符串 `order_id` 切到 `(channel, order_id)`，存量可信文件补写 `channel=direct`，状态持久化、重启保留、重复调用返回已生效版本 |
 
 ### 关键状态机
 
@@ -121,6 +123,35 @@ accepted ──run──> running ──ok──> published
 
 ---
 
+## 联营渠道一次性主键切换
+
+`daily_orders` 历史上以**字符串 `order_id` 作为全表唯一键**，规则中从未出现过 `channel`。接入联营（partner）渠道后，同一订单号可能同时来自直营（direct）与联营两个渠道，因此提供一次性、不可逆的口径切换：
+
+| 维度 | 切换前（旧口径） | 切换后（渠道口径） |
+| --- | --- | --- |
+| 全表主键 | `order_id`（字符串） | `(channel, order_id)` |
+| 受理的 Parquet | 无 `channel` 列 | 每行必须有 `channel`，取值仅 `direct` / `partner`，否则隔离（`not_allowed`）或缺列整批失败（`schema_mismatch`） |
+| 新发布规则版本 | — | 自动发布新版本，新增必填 `channel` 字段，主键改为复合键，`unique_scope` 固定 `dataset` |
+| 存量可信数据 | 原样保留 | 每个可信 Parquet 文件被原子重写，补写 `channel='direct'`，列顺序与新规则一致；切换前先逐文件备份 |
+| 切换前受理的批次 | 按受理时固定的 v1 规则与参考表校验 | **无论何时发布**仍用同一套固定规则与参考表，输出自动归为 `direct`；查重仍按单键 `order_id` |
+| 可信预览 | 不显示渠道 | 每行显示 `channel`（含迁移后的存量行） |
+
+隔离与唯一性语义：
+
+- **同渠道同号互相隔离**：批内重复为 `duplicate_key`，与已发布可信数据冲突为 `key_conflict_trusted`；跨日、跨新旧批次同样生效（`unique_scope=dataset`）。
+- **跨渠道同号共存**：`(direct, O-1)` 与 `(partner, O-1)` 是两个不同的全表键，即使日期不同也各自发布。
+
+一致性与持久化：
+
+- 切换状态写入 `channel_key_switches` 表，每个批次在 `batches.channel_mode` 固定其受理口径（`legacy` / `channel`）；进程重启后口径原样保留，旧库首次打开时自动补齐该列，存量批次默认 `legacy`。
+- 切换是**唯一提交点 + 备份回滚**：文件重写失败或元数据事务失败（错误码 `switch_failed`）时，已重写文件从备份恢复，不写入切换记录、不发布新规则版本，受理、查重、预览全部保持旧口径，之后可重新发起切换。
+- 切换**幂等**：重复调用返回 `already_effective=true` 与已生效的规则版本，不会产生第二个版本；页面按钮在生效后隐藏。
+- 切换与批次处理共用同一把串行锁，避免切换与校验/提交互相穿插。
+
+操作入口：规则版本页签顶部的「联营渠道接入 · 一次性主键切换」卡片，或 `POST /api/datasets/daily_orders/channel-switch`；`GET` 同路径查询当前切换状态。
+
+---
+
 ## API 摘要
 
 | 方法 | 路径 | 说明 |
@@ -131,6 +162,7 @@ accepted ──run──> running ──ok──> published
 | GET/POST | `/api/datasets` | 列表 / 创建数据集（含 v1 规则） |
 | GET | `/api/datasets/{name}` | 数据集详情（当前规则、分区） |
 | GET/POST | `/api/datasets/{name}/rules` | 规则版本列表 / 发布新版本 |
+| GET/POST | `/api/datasets/{name}/channel-switch` | 查询一次性渠道切换状态 / 执行切换（幂等，重复调用返回已生效版本） |
 | GET | `/api/datasets/{name}/partitions` | 已发布分区汇总 |
 | GET | `/api/datasets/{name}/preview?date=&limit=` | 可信数据预览 |
 | GET/POST | `/api/references` | 参考表版本列表 / 发布新版本 |
@@ -175,7 +207,20 @@ $GSB_DATA_DIR/
 
 ## 验证情况
 
-自动化测试共 39 个（`tests/test_gateway.py`、`tests/test_spec.py`），覆盖：
+自动化测试共 52 个（`tests/test_gateway.py`、`tests/test_spec.py`、`tests/test_channel_switch.py`），除原 39 个基线用例外，渠道切换专项覆盖：
+
+- 默认无切换状态、切换发布含 `channel` 的新不可变规则版本并迁移存量可信文件；
+- 切换幂等（重复调用返回已生效版本，不产生新版本）且重启后状态与口径完整回读；
+- 切换后新批次缺 `channel` 整批失败、非法渠道值逐行隔离；
+- 跨渠道同号共存（含跨日）、同渠道同号在批内与跨批次（含跨日、跨新旧批次）隔离；
+- 切换前受理的旧批次在切换后仍按固定 v1 规则发布并归为 `direct`，且保持单键查重；
+- 切换在文件迁移阶段或元数据事务阶段失败时备份回滚，受理、查重、预览全部保持旧口径，之后可重试成功；
+- 旧版 DuckDB（无 `channel_mode` 列、无切换表、可信文件无 `channel` 列）首次打开自动迁移，默认旧口径，再执行切换全链路正常；
+- 预览每行显示渠道。
+
+此外在本环境用真实 HTTP 服务 + 浏览器逻辑（jsdom 加载页面脚本）验证了：数据集/分区/预览渲染（含 channel 列与两渠道数据）、规则页一次性切换卡片的已生效状态与幂等、批次列表的口径标签、上传页渠道提示，均无前端未捕获异常。
+
+原 39 个基线用例仍全部通过，覆盖：
 
 - 基线数据集加载与页面/健康检查；
 - 正常批次按日分区发布与预览；
@@ -193,5 +238,3 @@ $GSB_DATA_DIR/
 - 已发布批次重跑失败时旧结果保留且标记 `previous_result_preserved`；
 - 服务重启恢复 `running` 批次、并发重跑返回 `batch_busy`；
 - 规则/引用定义校验、原生类型不被隐式重解释等规格单元测试。
-
-此外在本环境用真实 HTTP 服务 + 浏览器逻辑（jsdom 加载页面脚本）验证了：数据集/分区/预览渲染、批次列表与隔离区展开、规则 JSON 回填、参考表列表、表单上传、失败后重跑提示，均无前端未捕获异常。

@@ -84,6 +84,44 @@ def main() -> int:
         out / "orders_batch3_newer.parquet",
     )
 
+    # Channel-aware batches for the one-time (channel, order_id) switch.
+    # Upload these only after pressing the switch on the rules page.
+    def channel_orders(channels, order_ids, dates, customer_ids, amounts, currencies, statuses):
+        table = orders(order_ids, dates, customer_ids, amounts, currencies, statuses)
+        return table.append_column(
+            "channel", pa.array(channels, type=pa.string())
+        )
+
+    # Same order ids as the direct batch but on the partner channel: both rows
+    # must coexist with their direct twins because the full-table key is now
+    # (channel, order_id).
+    pq.write_table(
+        channel_orders(
+            ["partner", "partner"],
+            ["O-1", "O-2"],
+            ["2026-11-20", "2026-11-20"],
+            ["C-100", "C-101"],
+            [19.5, 42.0],
+            ["EUR", "USD"],
+            ["paid", "pending"],
+        ),
+        out / "orders_batch4_partner_same_ids.parquet",
+    )
+
+    # A direct-channel batch plus one invalid channel value to be quarantined.
+    pq.write_table(
+        channel_orders(
+            ["direct", "marketplace"],
+            ["O-20", "O-21"],
+            ["2026-11-23", "2026-11-23"],
+            ["C-102", "C-100"],
+            [8.0, 9.0],
+            ["USD", "EUR"],
+            ["paid", "paid"],
+        ),
+        out / "orders_batch5_channel_mixed.parquet",
+    )
+
     print(f"sample parquet files written to {out.resolve()}")
     return 0
 

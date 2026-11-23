@@ -8,6 +8,7 @@ const state = {
   selectedBatch: null,
   rulesVersions: [],
   specDirty: false,
+  channelSwitch: null,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -81,7 +82,10 @@ function updateTabCounts() {}
 function activateTab(name) {
   $$(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === name));
   $$(".panel").forEach((panel) => panel.classList.toggle("active", panel.id === `panel-${name}`));
-  if (name === "rules") loadRules();
+  if (name === "rules") {
+    loadRules();
+    loadChannelSwitch();
+  }
   if (name === "batches") loadBatches();
   if (name === "references") loadReferences();
   if (name === "datasets") loadDatasets();
@@ -130,6 +134,7 @@ async function loadDatasets() {
     datasetOptions($("#batch-filter"), true);
     datasetOptions($("#rules-dataset"));
     renderPartitions();
+    renderUploadChannelHint();
   } catch (error) {
     $("#dataset-list").innerHTML = `<div class="callout bad">${escapeHtml(error.message)}</div>`;
   }
@@ -233,6 +238,27 @@ async function loadPreview(dataset, dateKey) {
 // ---------------------------------------------------------------------------
 // Upload
 // ---------------------------------------------------------------------------
+function renderUploadChannelHint() {
+  const hint = $("#upload-channel-hint");
+  const name = $("#upload-dataset").value;
+  const dataset = state.datasets.find((item) => item.name === name);
+  if (!dataset) {
+    hint.hidden = true;
+    return;
+  }
+  if (dataset.channel_key_enabled) {
+    hint.hidden = false;
+    hint.className = "callout warn";
+    hint.innerHTML = `该数据集已切换到渠道口径：每行必须包含 <code>channel</code>（仅允许 <code>direct</code> 或 <code>partner</code>），全表主键为 <code>(channel, order_id)</code>。`;
+  } else {
+    hint.hidden = false;
+    hint.className = "callout";
+    hint.innerHTML = `该数据集仍为旧口径：全表唯一键为字符串 <code>order_id</code>，不需要 <code>channel</code> 列；发布后自动归为 <code>direct</code>。`;
+  }
+}
+
+$("#upload-dataset").addEventListener("change", renderUploadChannelHint);
+
 $("#upload-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const dataset = $("#upload-dataset").value;
@@ -331,7 +357,9 @@ function renderBatches() {
           <span class="name">${escapeHtml(batch.dataset)} · #${batch.acceptance_seq}</span>
           ${statusBadge(batch.status)}
         </div>
-        <div class="meta"><code>${shortId(batch.id)}</code> · 规则 v${batch.rules_version} · 第 ${batch.attempt} 次尝试</div>
+        <div class="meta"><code>${shortId(batch.id)}</code> · 规则 v${batch.rules_version} · 第 ${batch.attempt} 次尝试 · ${
+          batch.channel_mode === "channel" ? "渠道口径 (channel, order_id)" : "旧口径 order_id（归 direct）"
+        }</div>
         <div class="meta">${batch.row_count} 行 · 有效 ${batch.valid_count} · 隔离 ${batch.quarantine_count} · ${fmtTime(batch.accepted_at)}</div>
       </div>`;
   }).join("");
@@ -369,6 +397,11 @@ function renderBatchDetail(batch) {
     </div>
     <dl class="kv">
       <dt>受理序号</dt><dd>${batch.acceptance_seq}</dd>
+      <dt>主键口径</dt><dd>${
+        batch.channel_mode === "channel"
+          ? "渠道口径：全表主键 (channel, order_id)，channel ∈ direct / partner"
+          : "旧口径：全表唯一键 order_id（字符串）；发布时归为 direct"
+      }</dd>
       <dt>固定规则版本</dt><dd>v${batch.rules_version}（受理时固定）</dd>
       <dt>固定参考表</dt><dd>${escapeHtml(refs)}</dd>
       <dt>源文件</dt><dd>${(batch.source_files || []).map((f) => escapeHtml(f.original_name)).join(", ") || "—"}</dd>
@@ -487,6 +520,91 @@ function renderReasons(reasons) {
 }
 
 // ---------------------------------------------------------------------------
+// One-time channel-key switch
+// ---------------------------------------------------------------------------
+async function loadChannelSwitch() {
+  const select = $("#rules-dataset");
+  const status = $("#channel-switch-status");
+  const form = $("#channel-switch-form");
+  const note = $("#channel-switch-note");
+  const submit = $("#channel-switch-submit");
+  if (!select.value && state.datasets.length) select.value = state.datasets[0].name;
+  const dataset = select.value;
+  if (!dataset) {
+    status.className = "callout";
+    status.textContent = "没有可用数据集。";
+    form.hidden = true;
+    return;
+  }
+  try {
+    const data = await api(`/api/datasets/${encodeURIComponent(dataset)}/channel-switch`);
+    state.channelSwitch = data.switch;
+    if (data.switch) {
+      status.className = "callout ok";
+      status.innerHTML = `已生效：复合主键 <code>(channel, order_id)</code> · 规则版本 v${escapeHtml(
+        data.switch.rules_version
+      )} · 生效时间 ${escapeHtml(fmtTime(data.switch.switched_at))}`;
+      form.hidden = true;
+    } else {
+      status.className = "callout warn";
+      status.innerHTML = `当前为旧口径：全表唯一键仅 <code>order_id</code>（字符串），数据中没有 <code>channel</code>。`;
+      form.hidden = false;
+      note.value = "";
+      submit.disabled = false;
+      submit.textContent = "执行一次性切换";
+    }
+  } catch (error) {
+    status.className = "callout bad";
+    status.textContent = error.message;
+    form.hidden = false;
+  }
+}
+
+$("#channel-switch-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const dataset = $("#rules-dataset").value;
+  if (!dataset) return;
+  const confirmed = window.confirm(
+    `确认对 ${dataset} 执行一次性切换？\n\n` +
+      "• 新受理批次的每行必须包含 channel（direct 或 partner），主键变为 (channel, order_id)\n" +
+      "• 存量可信文件会补写 channel=direct\n" +
+      "• 切换前受理的批次继续按旧规则校验，发布后归为 direct\n" +
+      "• 切换失败时受理、查重和预览全部保持旧口径\n" +
+      "• 该操作不可逆且只能执行一次，重启后保持生效"
+  );
+  if (!confirmed) return;
+  const submit = $("#channel-switch-submit");
+  submit.disabled = true;
+  submit.textContent = "切换中…";
+  try {
+    const result = await api(
+      `/api/datasets/${encodeURIComponent(dataset)}/channel-switch`,
+      jsonBody({ note: $("#channel-switch-note").value.trim() || null })
+    );
+    if (result.already_effective) {
+      toast(`切换此前已生效（规则 v${result.rules_version}），未重复执行`, "ok");
+    } else {
+      toast(
+        `切换已生效：规则 v${result.rules_version}，${result.migrated_files} 个可信文件已补写 channel=direct`,
+        "ok"
+      );
+    }
+    state.specDirty = false;
+    await Promise.all([loadChannelSwitch(), loadRules(), loadDatasets(), loadBatches()]);
+  } catch (error) {
+    toast(`${error.code}: ${error.message}`, "bad");
+    submit.disabled = false;
+    submit.textContent = "执行一次性切换";
+  }
+});
+
+$("#rules-dataset").addEventListener("change", () => {
+  state.specDirty = false;
+  loadRules();
+  loadChannelSwitch();
+});
+
+// ---------------------------------------------------------------------------
 // Rules
 // ---------------------------------------------------------------------------
 async function loadRules() {
@@ -531,7 +649,6 @@ async function loadRules() {
   }
 }
 
-$("#rules-dataset").addEventListener("change", () => { state.specDirty = false; loadRules(); });
 $("#rules-spec").addEventListener("input", () => { state.specDirty = true; });
 
 $("#rules-form").addEventListener("submit", async (event) => {

@@ -64,6 +64,7 @@
             <span>上传后立即校验并发布</span>
           </label>
           <p class="hint">批次受理时会固定当前规则版本与参考表版本。超过 512 MB 的单次上传会被拒绝。</p>
+          <div class="callout" id="upload-channel-hint" hidden></div>
           <button type="submit" class="primary" id="upload-submit">上传并校验</button>
         </form>
         <div class="card">
@@ -96,6 +97,22 @@
 
     <!-- Rules -->
     <section class="panel" id="panel-rules">
+      <div class="card" id="channel-switch-card">
+        <h2>联营渠道接入 · 一次性主键切换</h2>
+        <p class="hint">
+          切换后 <code>daily_orders</code> 的全表主键变为 <code>(channel, order_id)</code>：新受理的 Parquet 每行必须带
+          <code>channel</code>（<code>direct</code> 或 <code>partner</code>）；切换前受理的批次始终按受理时固定的旧规则校验，
+          无论何时发布都归为 <code>direct</code>。存量可信数据会被补写 <code>channel=direct</code>，切换失败则一切保持旧口径。
+          该操作只能执行一次，重启后仍然生效。
+        </p>
+        <div id="channel-switch-status" class="callout">加载切换状态…</div>
+        <form id="channel-switch-form">
+          <label>变更说明（可选）
+            <input id="channel-switch-note" type="text" placeholder="例如：接入联营订单渠道" />
+          </label>
+          <button type="submit" class="primary" id="channel-switch-submit">执行一次性切换</button>
+        </form>
+      </div>
       <div class="grid two">
         <div class="card">
           <h2>规则版本</h2>

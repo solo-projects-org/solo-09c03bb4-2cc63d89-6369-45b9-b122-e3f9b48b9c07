@@ -61,6 +61,16 @@ CREATE TABLE IF NOT EXISTS batches (
     last_success_at TIMESTAMPTZ
 );
 
+-- Records the one-time switch from a single-column string key (order_id) to
+-- the composite (channel, order_id) key.  A row exists exactly when the
+-- dataset operates under channel semantics; it is never deleted, so a restart
+-- keeps the last effective semantics.
+CREATE TABLE IF NOT EXISTS channel_key_switches (
+    dataset VARCHAR PRIMARY KEY,
+    rules_version INTEGER NOT NULL,
+    switched_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS quarantine (
     batch_id VARCHAR NOT NULL,
     attempt INTEGER NOT NULL,
@@ -101,6 +111,7 @@ class Database:
         self.conn.execute("SET TimeZone='UTC'")
         with self.lock:
             self.conn.execute(SCHEMA_SQL)
+            self._migrate()
 
     def execute(self, sql: str, params: Iterable[Any] | None = None):
         with self.lock:
@@ -131,6 +142,22 @@ class Database:
                     self.conn.execute("ROLLBACK")
                 finally:
                     raise
+
+    def _migrate(self) -> None:
+        """Lightweight additive migrations for metadata created by older code."""
+        columns = {
+            row[1]
+            for row in self.conn.execute(
+                "SELECT table_name, column_name FROM information_schema.columns"
+                " WHERE table_name = 'batches'"
+            ).fetchall()
+        }
+        if "channel_mode" not in columns:
+            # Batches accepted before the channel switch keep legacy semantics.
+            self.conn.execute(
+                "ALTER TABLE batches ADD COLUMN channel_mode VARCHAR NOT NULL"
+                " DEFAULT 'legacy'"
+            )
 
     def close(self) -> None:
         with self.lock:
