@@ -1,0 +1,42 @@
+# Baseline rule versions loaded on first startup.
+# Existing datasets are never overwritten by this file.
+datasets:
+  - name: daily_orders
+    description: Canonical daily order facts trusted for downstream analytics.
+    rules_version: 1
+    note: Initial baseline
+    spec:
+      partition_field: order_date
+      primary_key: [order_id]
+      unique_scope: dataset
+      allow_extra_columns: false
+      fields:
+        - name: order_id
+          type: string
+          required: true
+          max_length: 64
+        - name: order_date
+          type: date
+          required: true
+        - name: customer_id
+          type: string
+          required: true
+          references:
+            table: customers
+            field: customer_id
+        - name: amount
+          type: number
+          required: true
+          min: 0
+          max: 1000000
+        - name: currency
+          type: string
+          required: true
+          regex: "^[A-Z]{3}$"
+        - name: status
+          type: string
+          required: true
+          allowed_values: [pending, paid, refunded]
+        - name: updated_at
+          type: timestamp
+          required: false

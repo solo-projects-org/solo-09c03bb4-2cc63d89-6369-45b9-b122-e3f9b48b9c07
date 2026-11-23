@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>可信数据网关 · Trusted Data Gateway</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">▣</span>
+      <div>
+        <h1>可信数据网关</h1>
+        <p>Parquet 批次校验 · 按日分区发布 · 规则版本固定</p>
+      </div>
+    </div>
+    <div class="stats" id="stats">
+      <span class="loading">加载中…</span>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="datasets" role="tab">数据集</button>
+    <button class="tab" data-tab="upload" role="tab">上传批次</button>
+    <button class="tab" data-tab="batches" role="tab">批次与隔离区</button>
+    <button class="tab" data-tab="rules" role="tab">规则版本</button>
+    <button class="tab" data-tab="references" role="tab">参考表</button>
+  </nav>
+
+  <main>
+    <div id="toast" class="toast" hidden></div>
+
+    <!-- Datasets -->
+    <section class="panel active" id="panel-datasets">
+      <div class="grid two">
+        <div class="card">
+          <h2>数据集</h2>
+          <div id="dataset-list" class="list"></div>
+        </div>
+        <div class="card">
+          <h2>已发布分区</h2>
+          <div class="muted" id="partition-caption">选择左侧数据集查看分区。</div>
+          <div id="partition-list" class="list compact"></div>
+          <h3>可信数据预览 <span class="muted" id="preview-caption"></span></h3>
+          <div class="table-wrap" id="preview-table"><p class="muted">暂无数据。</p></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Upload -->
+    <section class="panel" id="panel-upload">
+      <div class="grid two">
+        <form class="card" id="upload-form">
+          <h2>上传批次</h2>
+          <label>目标数据集
+            <select id="upload-dataset" required></select>
+          </label>
+          <label>Parquet 文件（可多选）
+            <input type="file" id="upload-files" accept=".parquet" multiple required />
+          </label>
+          <label class="row">
+            <input type="checkbox" id="upload-process" checked />
+            <span>上传后立即校验并发布</span>
+          </label>
+          <p class="hint">批次受理时会固定当前规则版本与参考表版本。超过 512 MB 的单次上传会被拒绝。</p>
+          <button type="submit" class="primary" id="upload-submit">上传并校验</button>
+        </form>
+        <div class="card">
+          <h2>批次结果</h2>
+          <div id="upload-result" class="result muted">上传后在此显示校验结果。</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Batches -->
+    <section class="panel" id="panel-batches">
+      <div class="grid two">
+        <div class="card">
+          <h2>批次列表</h2>
+          <label class="inline">数据集
+            <select id="batch-filter"></select>
+          </label>
+          <div id="batch-list" class="list"></div>
+        </div>
+        <div class="card">
+          <h2>批次详情</h2>
+          <div id="batch-detail" class="muted">选择左侧批次查看详情。</div>
+        </div>
+      </div>
+      <div class="card" id="quarantine-card" hidden>
+        <h2>隔离区 <span class="muted" id="quarantine-caption"></span></h2>
+        <div class="table-wrap" id="quarantine-table"></div>
+      </div>
+    </section>
+
+    <!-- Rules -->
+    <section class="panel" id="panel-rules">
+      <div class="grid two">
+        <div class="card">
+          <h2>规则版本</h2>
+          <label class="inline">数据集
+            <select id="rules-dataset"></select>
+          </label>
+          <div id="rules-list" class="list"></div>
+        </div>
+        <form class="card" id="rules-form">
+          <h2>发布新规则版本</h2>
+          <p class="hint">规则版本不可修改。新版本只影响之后受理的批次；已受理批次仍使用受理时固定的版本。</p>
+          <label>基于版本
+            <input id="rules-expected" type="number" min="1" readonly />
+          </label>
+          <label>变更说明
+            <input id="rules-note" type="text" placeholder="例如：amount 上限调整为 5000" />
+          </label>
+          <label>规则 JSON / YAML
+            <textarea id="rules-spec" rows="18" spellcheck="false"></textarea>
+          </label>
+          <button type="submit" class="primary">发布新版本</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- References -->
+    <section class="panel" id="panel-references">
+      <div class="grid two">
+        <div class="card">
+          <h2>参考表版本</h2>
+          <div id="reference-list" class="list"></div>
+        </div>
+        <form class="card" id="reference-form">
+          <h2>发布参考表</h2>
+          <p class="hint">参考表主键必须唯一且非空。批次受理时固定当时最新的参考表版本。</p>
+          <label>名称
+            <input id="reference-name" type="text" placeholder="customers" required />
+          </label>
+          <label>主键字段
+            <input id="reference-key" type="text" placeholder="customer_id" required />
+          </label>
+          <label>说明
+            <input id="reference-note" type="text" placeholder="可选" />
+          </label>
+          <label>Parquet 文件
+            <input id="reference-file" type="file" accept=".parquet" required />
+          </label>
+          <button type="submit" class="primary">发布参考表版本</button>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>规则固定 · 失败隔离 · 分区原子替换 · 过期批次拒绝覆盖</span>
+    <span><a href="/docs" target="_blank" rel="noreferrer">API 文档</a></span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

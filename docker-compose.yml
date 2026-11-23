@@ -1,0 +1,17 @@
+services:
+  gateway:
+    build: .
+    image: trusted-data-gateway:latest
+    ports:
+      - "8000:8000"
+    environment:
+      GSB_DATA_DIR: /data
+      GSB_RULES_FILE: /app/config/rules.yaml
+      GSB_MAX_UPLOAD_BYTES: "536870912"
+      GSB_MAX_FILES: "50"
+    volumes:
+      - gateway-data:/data
+    restart: unless-stopped
+
+volumes:
+  gateway-data:
